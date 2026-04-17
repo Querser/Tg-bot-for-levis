@@ -1,0 +1,28 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environment (local Windows venv layout)
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# Runtime files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Tooling
+.idea/
+.vscode/

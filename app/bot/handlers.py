@@ -128,6 +128,7 @@ def register_handlers(
             if payment.confirmation_url:
                 await sender(
                     "💳 Оплата еще в процессе.\n"
+                    f"Сумма: {payment.amount_rub} RUB\n"
                     f"Ссылка: {payment.confirmation_url}\n\n"
                     "После оплаты проверьте «Мои билеты» 🎫",
                     reply_markup=payment_inline_keyboard(payment.confirmation_url),
@@ -170,11 +171,12 @@ def register_handlers(
             await sender("⚠️ Не хватает данных анкеты. Нажмите «Купить билет» и заполните заново.", reply_markup=main_actions_inline_keyboard())
             return
 
-        ticket_price_rub = payment_amount_rub
         try:
             ticket_price_rub = await event_settings_service.get_ticket_price_rub()
         except Exception:
-            LOGGER.exception("Failed to load ticket price from settings. Fallback to default value.")
+            LOGGER.exception("Failed to load ticket price from settings. Payment creation canceled.")
+            await sender("⚠️ Не удалось получить актуальную цену билета. Попробуйте еще раз.")
+            return
 
         buy_inflight.add(user.id)
         try:
@@ -203,17 +205,14 @@ def register_handlers(
     async def process_buy(user: User, sender, state: FSMContext) -> None:
         latest = await payment_service.refresh_latest_user_payment(user.id)
         if latest and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
-            if latest.confirmation_url:
-                await handle_payment_state(latest, sender)
-                return
             refreshed = latest
             if latest.yookassa_payment_id:
                 candidate = await payment_service.refresh_payment_status(latest.yookassa_payment_id)
                 if candidate is not None:
                     refreshed = candidate
-                if refreshed.confirmation_url:
-                    await handle_payment_state(refreshed, sender)
-                    return
+            if refreshed.status == PaymentStatus.SUCCEEDED:
+                await handle_payment_state(refreshed, sender)
+                return
             if refreshed.full_name and refreshed.phone and refreshed.age is not None:
                 await state.update_data(full_name=refreshed.full_name, age=refreshed.age, phone=refreshed.phone)
                 await attempt_payment_creation_with_profile(user, sender, state)

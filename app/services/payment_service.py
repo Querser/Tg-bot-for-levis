@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from app.domain import PaymentRecord, PaymentStatus
-from app.integrations.yookassa_client import YooKassaClient, YooKassaPayment
+from app.integrations.yookassa_client import (
+    YooKassaAPIError,
+    YooKassaClient,
+    YooKassaError,
+    YooKassaPayment,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PaymentServiceError(RuntimeError):
@@ -181,9 +189,31 @@ class PaymentService:
 
     async def refresh_payment_status(self, yookassa_payment_id: str) -> PaymentRecord | None:
         clean_payment_id = self._require_non_empty(yookassa_payment_id, "yookassa_payment_id")
-        remote_payment = await self._yookassa_client.get_payment(clean_payment_id)
-
         local_record = await self._repository.get_payment_by_yookassa_payment_id(clean_payment_id)
+
+        try:
+            remote_payment = await self._yookassa_client.get_payment(clean_payment_id)
+        except YooKassaAPIError as exc:
+            if local_record is None:
+                raise
+            await self._mark_payment_error(local_record.local_id, exc)
+            if exc.status_code in {400, 404}:
+                LOGGER.warning(
+                    "Marking payment local_id=%s as canceled: YooKassa no longer allows access to payment_id=%s",
+                    local_record.local_id,
+                    clean_payment_id,
+                )
+                return await self._repository.update_payment_record(
+                    local_id=local_record.local_id,
+                    status=PaymentStatus.CANCELED,
+                )
+            return local_record
+        except YooKassaError as exc:
+            if local_record is None:
+                raise
+            await self._mark_payment_error(local_record.local_id, exc)
+            return local_record
+
         if local_record is None:
             idempotency_key = remote_payment.metadata.get("idempotency_key")
             if idempotency_key:
@@ -204,7 +234,8 @@ class PaymentService:
             return None
         if local_record.yookassa_payment_id is None:
             return local_record
-        return await self.refresh_payment_status(local_record.yookassa_payment_id)
+        refreshed = await self.refresh_payment_status(local_record.yookassa_payment_id)
+        return refreshed or local_record
 
     async def ensure_ticket_for_payment(self, payment: PaymentRecord) -> PaymentRecord:
         if payment.status != PaymentStatus.SUCCEEDED:
@@ -221,6 +252,17 @@ class PaymentService:
         raise PaymentServiceError("Не удалось сгенерировать уникальный 3-значный билет.")
 
     async def check_and_consume_ticket(self, ticket_number: str) -> TicketCheckResult:
+        checked = await self.check_ticket(ticket_number)
+        if checked.status != "valid":
+            return checked
+
+        if checked.payment is None or checked.payment.ticket_number is None:
+            return TicketCheckResult(status="not_found", payment=None)
+
+        updated = await self._repository.mark_ticket_as_used(checked.payment.local_id)
+        return TicketCheckResult(status="valid_consumed", payment=updated)
+
+    async def check_ticket(self, ticket_number: str) -> TicketCheckResult:
         clean_ticket = self._normalize_ticket_number(ticket_number)
         payment = await self._repository.get_payment_by_ticket_number(clean_ticket)
         if payment is None:
@@ -232,8 +274,7 @@ class PaymentService:
         if not payment.ticket_valid:
             return TicketCheckResult(status="already_used", payment=payment)
 
-        updated = await self._repository.mark_ticket_as_used(payment.local_id)
-        return TicketCheckResult(status="valid_consumed", payment=updated)
+        return TicketCheckResult(status="valid", payment=payment)
 
     async def list_purchases(self) -> list[PaymentRecord]:
         return await self._repository.list_all()

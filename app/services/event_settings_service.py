@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Protocol, runtime_checkable
 
 
@@ -16,6 +17,7 @@ class AppSettingsRepositoryProtocol(Protocol):
 
 class EventSettingsService:
     EVENT_ADDRESS_KEY = "event_address"
+    KNOWN_USER_IDS_KEY = "known_user_ids"
 
     def __init__(
         self,
@@ -39,6 +41,34 @@ class EventSettingsService:
         await self._repository.set_value(self.EVENT_ADDRESS_KEY, clean)
         return clean
 
+    async def register_known_user(self, telegram_user_id: int) -> None:
+        user_id = self._normalize_user_id(telegram_user_id)
+        existing = await self.list_known_user_ids()
+        if user_id in existing:
+            return
+        updated = sorted(existing + [user_id])
+        await self._repository.set_value(self.KNOWN_USER_IDS_KEY, json.dumps(updated))
+
+    async def list_known_user_ids(self) -> list[int]:
+        raw_value = await self._repository.get_value(self.KNOWN_USER_IDS_KEY)
+        if raw_value is None or not raw_value.strip():
+            return []
+        try:
+            payload = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        clean_ids: list[int] = []
+        for value in payload:
+            try:
+                normalized = self._normalize_user_id(value)
+            except EventSettingsValidationError:
+                continue
+            if normalized not in clean_ids:
+                clean_ids.append(normalized)
+        return sorted(clean_ids)
+
     @staticmethod
     def _require_non_empty(value: str, field_name: str) -> str:
         if not isinstance(value, str):
@@ -47,3 +77,13 @@ class EventSettingsService:
         if not clean:
             raise EventSettingsValidationError(f"{field_name} must not be empty.")
         return clean
+
+    @staticmethod
+    def _normalize_user_id(value: object) -> int:
+        try:
+            user_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise EventSettingsValidationError("telegram_user_id must be an integer.") from exc
+        if user_id <= 0:
+            raise EventSettingsValidationError("telegram_user_id must be greater than zero.")
+        return user_id

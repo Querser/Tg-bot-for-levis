@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -16,10 +17,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message, User
 
 from app.bot.keyboards import (
+    ADMIN_BROADCAST_CALLBACK,
     ADMIN_CHECK_TICKET_CALLBACK,
     ADMIN_EXPORT_CALLBACK,
     ADMIN_PANEL_BUTTON_TEXT,
     ADMIN_SET_EVENT_ADDRESS_CALLBACK,
+    ADMIN_TICKET_BACK_CALLBACK,
+    ADMIN_TICKET_SKIP_CALLBACK,
     BUY_TICKET_BUTTON_TEXT,
     BUY_TICKET_CALLBACK,
     CHECK_PAYMENT_BUTTON_TEXT,
@@ -29,17 +33,14 @@ from app.bot.keyboards import (
     MY_TICKETS_BUTTON_TEXT,
     MY_TICKETS_CALLBACK,
     admin_panel_inline_keyboard,
+    admin_ticket_check_inline_keyboard,
     main_actions_inline_keyboard,
     main_menu_keyboard,
     payment_inline_keyboard,
 )
 from app.domain import PaymentRecord, PaymentStatus
 from app.services import EventSettingsService
-from app.services.payment_service import (
-    PaymentService,
-    PaymentServiceError,
-    PaymentValidationError,
-)
+from app.services.payment_service import PaymentService, PaymentServiceError, PaymentValidationError
 
 LOGGER = logging.getLogger(__name__)
 PHONE_PATTERN = re.compile(r"^\+?[0-9\-\s\(\)]{10,20}$")
@@ -59,6 +60,10 @@ class AdminEventAddressState(StatesGroup):
     waiting_event_address = State()
 
 
+class AdminBroadcastState(StatesGroup):
+    waiting_broadcast_text = State()
+
+
 def register_handlers(
     router: Router,
     payment_service: PaymentService,
@@ -70,8 +75,8 @@ def register_handlers(
     payment_return_url: str = "https://t.me",
 ) -> None:
     buy_inflight: set[int] = set()
-    super_admin_set = {int(admin_id) for admin_id in super_admin_ids}
-    ticket_admin_set = {int(admin_id) for admin_id in ticket_admin_ids}
+    super_admin_set = {int(x) for x in super_admin_ids}
+    ticket_admin_set = {int(x) for x in ticket_admin_ids}
 
     def is_super_admin(user_id: int) -> bool:
         return user_id in super_admin_set
@@ -79,11 +84,15 @@ def register_handlers(
     def can_check_tickets(user_id: int) -> bool:
         return user_id in super_admin_set or user_id in ticket_admin_set
 
-    async def send_to_callback_origin(
-        callback: CallbackQuery,
-        text: str,
-        reply_markup=None,
-    ) -> None:
+    async def remember_user(user: User | None) -> None:
+        if user is None:
+            return
+        try:
+            await event_settings_service.register_known_user(user.id)
+        except Exception:
+            LOGGER.exception("Failed to remember user %s", user.id)
+
+    async def send_to_callback_origin(callback: CallbackQuery, text: str, reply_markup=None) -> None:
         if callback.message:
             await callback.message.answer(text, reply_markup=reply_markup)
             return
@@ -92,73 +101,54 @@ def register_handlers(
     async def send_admin_panel(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else 0
         if not can_check_tickets(user_id):
-            await message.answer("⛔ Доступ только для администраторов.")
+            await message.answer("⛔ Доступ только для админов.")
             return
-
+        role = "🫅 Главный админ" if is_super_admin(user_id) else "🛡 Контролер билетов"
         event_address = await event_settings_service.get_event_address()
-        role_text = "👑 Главный админ" if is_super_admin(user_id) else "🛡 Контролер билетов"
         await message.answer(
-            "🛠 Админ-панель\n"
-            f"Роль: {role_text}\n"
-            f"📍 Адрес мероприятия: {event_address}",
+            "🛠 Админ-панель\n" f"Роль: {role}\n" f"📍 Адрес: {event_address}",
             reply_markup=admin_panel_inline_keyboard(
                 can_export=is_super_admin(user_id),
                 can_set_event_address=is_super_admin(user_id),
+                can_broadcast=is_super_admin(user_id),
             ),
         )
 
-    async def handle_payment_state(
-        payment: PaymentRecord | None,
-        sender,
-    ) -> None:
+    async def handle_payment_state(payment: PaymentRecord | None, sender) -> None:
         if payment is None:
-            await sender(
-                "😕 Пока не вижу активных оплат. Нажмите «Купить билет», и начнем.",
-                reply_markup=main_actions_inline_keyboard(),
-            )
+            await sender("😕 Активных оплат пока нет. Нажмите «Купить билет».", reply_markup=main_actions_inline_keyboard())
             return
-
         if payment.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
             if payment.confirmation_url:
                 await sender(
-                    "💳 Оплата ещё в процессе.\n"
-                    f"Ссылка на оплату: {payment.confirmation_url}\n\n"
-                    "После оплаты загляните в «Мои билеты» 🎫",
+                    "💳 Оплата еще в процессе.\n"
+                    f"Ссылка: {payment.confirmation_url}\n\n"
+                    "После оплаты проверьте «Мои билеты» 🎫",
                     reply_markup=payment_inline_keyboard(payment.confirmation_url),
                 )
             else:
-                await sender(
-                    "⌛ Платеж создан, но ссылка еще не пришла. Нажмите «Купить билет» повторно — создам новый.",
-                    reply_markup=main_actions_inline_keyboard(),
-                )
+                await sender("⌛ Платеж есть, но без ссылки. Нажмите «Купить билет» еще раз.", reply_markup=main_actions_inline_keyboard())
             return
-
         if payment.status == PaymentStatus.SUCCEEDED:
-            payment_with_ticket = await payment_service.ensure_ticket_for_payment(payment)
+            p = await payment_service.ensure_ticket_for_payment(payment)
             event_address = await event_settings_service.get_event_address()
-            ticket_emoji = "✅" if payment_with_ticket.ticket_valid else "❌"
-            ticket_status = "активен" if payment_with_ticket.ticket_valid else "уже использован"
+            emoji = "✅" if p.ticket_valid else "❌"
+            status = "активен" if p.ticket_valid else "использован"
             await sender(
                 "🎉 Оплата подтверждена!\n"
-                f"🎟 Номер билета: {payment_with_ticket.ticket_number}\n"
-                f"Статус: {ticket_emoji} {ticket_status}\n"
-                f"📍 Адрес: {event_address}\n\n"
-                "Покажите номер билета на входе 🙌",
+                f"🎟 Билет: {p.ticket_number}\n"
+                f"Статус: {emoji} {status}\n"
+                f"📍 Адрес: {event_address}",
                 reply_markup=main_actions_inline_keyboard(),
             )
             return
-
-        await sender(
-            "⚠️ Оплата не завершена. Можно создать новую попытку через «Купить билет».",
-            reply_markup=main_actions_inline_keyboard(),
-        )
+        await sender("⚠️ Оплата не завершена. Можно создать новую попытку.", reply_markup=main_actions_inline_keyboard())
 
     async def start_profile_collection(user: User, state: FSMContext, sender) -> None:
         await state.clear()
         await state.set_state(PurchaseFormState.waiting_full_name)
         await sender(
-            "🎟 Перед оплатой заполните данные.\n"
-            "Шаг 1/3: отправьте ФИО.",
+            "🎟 Перед оплатой заполните данные.\nШаг 1/3: отправьте ФИО.",
             reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user.id)),
         )
 
@@ -166,232 +156,166 @@ def register_handlers(
         if user.id in buy_inflight:
             await sender("⏳ Уже создаю платеж, подождите пару секунд.")
             return
-
-        form_data = await state.get_data()
-        full_name = str(form_data.get("full_name", "")).strip()
-        phone = str(form_data.get("phone", "")).strip()
-        age_raw = form_data.get("age")
-
+        data = await state.get_data()
+        full_name = str(data.get("full_name", "")).strip()
+        phone = str(data.get("phone", "")).strip()
+        age_raw = data.get("age")
         if not full_name or not phone or age_raw is None:
-            await sender(
-                "⚠️ Не хватает данных анкеты. Нажмите «Купить билет» и заполните форму заново.",
-                reply_markup=main_actions_inline_keyboard(),
-            )
+            await sender("⚠️ Не хватает данных анкеты. Нажмите «Купить билет» и заполните заново.", reply_markup=main_actions_inline_keyboard())
             return
 
-        age = int(age_raw)
         buy_inflight.add(user.id)
         try:
-            metadata = {
-                "source": "telegram_bot",
-                "product": "event_ticket",
-                "full_name": full_name,
-                "age": str(age),
-                "phone": phone,
-            }
             payment = await payment_service.create_payment(
                 telegram_user_id=user.id,
                 full_name=full_name,
-                age=age,
+                age=int(age_raw),
                 phone=phone,
                 amount_rub=payment_amount_rub,
                 description=payment_description,
-                metadata=metadata,
+                metadata={"source": "telegram_bot", "product": "event_ticket", "full_name": full_name, "age": str(age_raw), "phone": phone},
                 idempotency_key=f"tg-{user.id}-{uuid4().hex}",
                 return_url=payment_return_url,
             )
             await state.clear()
             await handle_payment_state(payment, sender)
         except PaymentServiceError:
-            LOGGER.exception("Payment service error for user_id=%s", user.id)
-            await sender("😵 Сервис оплаты временно недоступен. Попробуйте чуть позже.")
+            LOGGER.exception("Payment service error user=%s", user.id)
+            await sender("😵 Сервис оплаты временно недоступен.")
         except Exception:
-            LOGGER.exception("Unexpected payment creation error for user_id=%s", user.id)
-            await sender("😬 Что-то пошло не так. Попробуйте снова через минуту.")
+            LOGGER.exception("Unexpected payment creation error user=%s", user.id)
+            await sender("😬 Что-то пошло не так, попробуйте позже.")
         finally:
             buy_inflight.discard(user.id)
 
     async def process_buy(user: User, sender, state: FSMContext) -> None:
         latest = await payment_service.refresh_latest_user_payment(user.id)
-        if latest is not None and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
+        if latest and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
             if latest.confirmation_url:
                 await handle_payment_state(latest, sender)
                 return
-
             refreshed = latest
             if latest.yookassa_payment_id:
-                refreshed_candidate = await payment_service.refresh_payment_status(latest.yookassa_payment_id)
-                if refreshed_candidate is not None:
-                    refreshed = refreshed_candidate
+                candidate = await payment_service.refresh_payment_status(latest.yookassa_payment_id)
+                if candidate is not None:
+                    refreshed = candidate
                 if refreshed.confirmation_url:
                     await handle_payment_state(refreshed, sender)
                     return
-
             if refreshed.full_name and refreshed.phone and refreshed.age is not None:
-                await state.update_data(
-                    full_name=refreshed.full_name,
-                    age=refreshed.age,
-                    phone=refreshed.phone,
-                )
+                await state.update_data(full_name=refreshed.full_name, age=refreshed.age, phone=refreshed.phone)
                 await attempt_payment_creation_with_profile(user, sender, state)
                 return
-
-        if latest is not None and latest.status == PaymentStatus.SUCCEEDED:
-            await sender("🙂 У вас уже есть оплаченный билет. Если хотите, можно купить ещё один.")
+        if latest and latest.status == PaymentStatus.SUCCEEDED:
+            await sender("🙂 У вас уже есть оплаченный билет, но можно купить еще один.")
         await start_profile_collection(user, state, sender)
 
     async def process_check_payment(user: User, sender, state: FSMContext) -> None:
-        current_state = await state.get_state()
-        if current_state in {
+        if await state.get_state() in {
             PurchaseFormState.waiting_full_name.state,
             PurchaseFormState.waiting_age.state,
             PurchaseFormState.waiting_phone.state,
         }:
-            await sender("✍️ Сначала завершите анкету, потом проверим оплату.")
+            await sender("✌️ Сначала завершите анкету.")
             return
-
         payment = await payment_service.refresh_latest_user_payment(user.id)
-        if (
-            payment is not None
-            and payment.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}
-            and not payment.confirmation_url
-        ):
-            await sender("⌛ У текущего платежа нет ссылки. Нажмите «Купить билет», создам новый платеж.")
+        if payment and payment.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE} and not payment.confirmation_url:
+            await sender("⌛ У текущего платежа нет ссылки. Нажмите «Купить билет», создам новый.")
             return
         await handle_payment_state(payment, sender)
 
     async def process_my_tickets(user: User, sender, state: FSMContext) -> None:
-        current_state = await state.get_state()
-        if current_state in {
+        if await state.get_state() in {
             PurchaseFormState.waiting_full_name.state,
             PurchaseFormState.waiting_age.state,
             PurchaseFormState.waiting_phone.state,
         }:
-            await sender("✍️ Сначала завершите анкету, потом покажу билеты.")
+            await sender("✌️ Сначала завершите анкету.")
             return
-
         latest = await payment_service.refresh_latest_user_payment(user.id)
         tickets = await payment_service.list_user_tickets(user.id)
         event_address = await event_settings_service.get_event_address()
-
         if not tickets:
-            if latest is not None and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
+            if latest and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
                 if latest.confirmation_url:
                     await sender(
-                        "⌛ Оплата еще обрабатывается. Как только пройдет, билет появится здесь.\n"
-                        f"Ссылка на оплату: {latest.confirmation_url}",
+                        "⌛ Оплата обрабатывается, билет появится здесь.\n"
+                        f"Ссылка: {latest.confirmation_url}",
                         reply_markup=payment_inline_keyboard(latest.confirmation_url),
                     )
                     return
-                await sender("⌛ Платеж есть, но без ссылки. Нажмите «Купить билет», создам новый.")
+                await sender("⌛ Платеж есть, но без ссылки. Нажмите «Купить билет».")
                 return
-
-            await sender(
-                "🎫 Пока билетов нет.\n"
-                "Нажмите «Купить билет», и всё оформим 🚀",
-                reply_markup=main_actions_inline_keyboard(),
-            )
+            await sender("🎫 Пока билетов нет. Нажмите «Купить билет».", reply_markup=main_actions_inline_keyboard())
             return
-
         lines = ["🎫 Ваши билеты:"]
-        for ticket in tickets:
-            status_emoji = "✅" if ticket.ticket_valid else "❌"
-            status_text = "активен" if ticket.ticket_valid else "неактивен"
-            lines.append(f"• {ticket.ticket_number} {status_emoji} {status_text}")
-        lines.append(f"\n📍 Адрес мероприятия: {event_address}")
+        for t in tickets:
+            emoji = "✅" if t.ticket_valid else "❌"
+            status = "активен" if t.ticket_valid else "неактивен"
+            lines.append(f"• {t.ticket_number} {emoji} {status}")
+        lines.append(f"\n📍 Адрес: {event_address}")
         await sender("\n".join(lines), reply_markup=main_actions_inline_keyboard())
 
     def build_purchases_csv(purchases: list[PaymentRecord]) -> bytes:
         buffer = io.StringIO()
         writer = csv.writer(buffer, delimiter=";")
-        writer.writerow(
-            [
-                "ID",
-                "TelegramUserID",
-                "FullName",
-                "Age",
-                "Phone",
-                "Amount",
-                "Currency",
-                "PaymentStatus",
-                "TicketNumber",
-                "TicketValid",
-                "TicketUsedAtUTC",
-                "YooKassaPaymentID",
-                "PaymentLink",
-                "CreatedUTC",
-            ]
-        )
-        for payment in purchases:
-            writer.writerow(
-                [
-                    payment.local_id,
-                    payment.telegram_user_id,
-                    payment.full_name or "",
-                    payment.age if payment.age is not None else "",
-                    payment.phone or "",
-                    str(payment.amount_rub),
-                    payment.currency,
-                    payment.status.value,
-                    payment.ticket_number or "",
-                    "yes" if payment.ticket_valid else "no",
-                    payment.ticket_used_at.isoformat() if payment.ticket_used_at else "",
-                    payment.yookassa_payment_id or "",
-                    payment.confirmation_url or "",
-                    payment.created_at.isoformat(),
-                ]
-            )
+        writer.writerow(["ID", "TelegramUserID", "FullName", "Age", "Phone", "Amount", "Currency", "PaymentStatus", "TicketNumber", "TicketValid", "TicketUsedAtUTC", "YooKassaPaymentID", "PaymentLink", "CreatedUTC"])
+        for p in purchases:
+            writer.writerow([p.local_id, p.telegram_user_id, p.full_name or "", p.age if p.age is not None else "", p.phone or "", str(p.amount_rub), p.currency, p.status.value, p.ticket_number or "", "yes" if p.ticket_valid else "no", p.ticket_used_at.isoformat() if p.ticket_used_at else "", p.yookassa_payment_id or "", p.confirmation_url or "", p.created_at.isoformat()])
         return buffer.getvalue().encode("utf-8-sig")
+
+    async def collect_broadcast_recipients(sender_user_id: int) -> list[int]:
+        ids = set(await event_settings_service.list_known_user_ids())
+        ids.update(item.telegram_user_id for item in await payment_service.list_purchases())
+        ids.discard(sender_user_id)
+        return sorted(ids)
 
     @router.message(CommandStart())
     async def on_start(message: Message) -> None:
+        await remember_user(message.from_user)
         user = message.from_user
-        username = user.first_name if user else "друг"
+        name = user.first_name if user else "друг"
         await message.answer(
-            f"Привет, {username}! 👋\n"
-            "Я помогу оформить билет на мероприятие.\n"
-            "Выбирайте действие ниже 👇",
+            f"Привет, {name}! 👋\nЯ помогу оформить билет.\nВыберите действие 👇",
             reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user.id if user else 0)),
         )
 
     @router.message(Command("help"))
     async def on_help(message: Message) -> None:
+        await remember_user(message.from_user)
         user_id = message.from_user.id if message.from_user else 0
         await message.answer(
-            "ℹ️ Как это работает:\n"
-            "1) Нажмите «Купить билет» 🎟\n"
-            "2) Введите ФИО, возраст и телефон\n"
-            "3) Оплатите по ссылке YooKassa 💳\n"
-            "4) Билет появится в разделе «Мои билеты» 🎫\n\n"
-            "Важно: мероприятие 18+ 🔞",
+            "ℹ️ Как это работает:\n1) «Купить билет»\n2) ФИО, возраст, телефон\n3) Оплата YooKassa\n4) Билет в «Мои билеты»\n\nМероприятие 18+ 🔞",
             reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)),
         )
 
     @router.message(Command("admin"))
     async def on_admin_command(message: Message) -> None:
+        await remember_user(message.from_user)
         await send_admin_panel(message)
 
     @router.message(F.text.casefold() == ADMIN_PANEL_BUTTON_TEXT.casefold())
     async def on_admin_button(message: Message) -> None:
+        await remember_user(message.from_user)
         await send_admin_panel(message)
 
     @router.message(F.text.casefold() == BUY_TICKET_BUTTON_TEXT.casefold())
     async def on_buy_message(message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
-        await process_buy(message.from_user, message.answer, state)
+        await remember_user(message.from_user)
+        if message.from_user:
+            await process_buy(message.from_user, message.answer, state)
 
     @router.message(F.text.casefold() == CHECK_PAYMENT_BUTTON_TEXT.casefold())
     async def on_check_payment_message(message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
-        await process_check_payment(message.from_user, message.answer, state)
+        await remember_user(message.from_user)
+        if message.from_user:
+            await process_check_payment(message.from_user, message.answer, state)
 
     @router.message(F.text.casefold() == MY_TICKETS_BUTTON_TEXT.casefold())
     async def on_my_tickets_message(message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
-        await process_my_tickets(message.from_user, message.answer, state)
+        await remember_user(message.from_user)
+        if message.from_user:
+            await process_my_tickets(message.from_user, message.answer, state)
 
     @router.message(F.text.casefold() == HELP_BUTTON_TEXT.casefold())
     async def on_help_message(message: Message) -> None:
@@ -399,43 +323,31 @@ def register_handlers(
 
     @router.callback_query(F.data == BUY_TICKET_CALLBACK)
     async def on_buy_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
         await callback.answer()
-        await process_buy(
-            callback.from_user,
-            lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs),
-            state,
-        )
+        await process_buy(callback.from_user, lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs), state)
 
     @router.callback_query(F.data == CHECK_PAYMENT_CALLBACK)
     async def on_check_payment_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
         await callback.answer()
-        await process_check_payment(
-            callback.from_user,
-            lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs),
-            state,
-        )
+        await process_check_payment(callback.from_user, lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs), state)
 
     @router.callback_query(F.data == MY_TICKETS_CALLBACK)
     async def on_my_tickets_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
         await callback.answer()
-        await process_my_tickets(
-            callback.from_user,
-            lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs),
-            state,
-        )
+        await process_my_tickets(callback.from_user, lambda text, **kwargs: send_to_callback_origin(callback, text, **kwargs), state)
 
     @router.callback_query(F.data == HELP_CALLBACK)
     async def on_help_callback(callback: CallbackQuery) -> None:
+        await remember_user(callback.from_user)
         await callback.answer()
-        await send_to_callback_origin(
-            callback,
-            "Нужна помощь? Напишите администратору 🙌\n"
-            "И да, мероприятие строго 18+ 🔞",
-            reply_markup=main_actions_inline_keyboard(),
-        )
+        await send_to_callback_origin(callback, "Нужна помощь? Напишите администратору 🙌\nМероприятие строго 18+ 🔞", reply_markup=main_actions_inline_keyboard())
 
     @router.callback_query(F.data == ADMIN_EXPORT_CALLBACK)
     async def on_admin_export_callback(callback: CallbackQuery) -> None:
+        await remember_user(callback.from_user)
         user_id = callback.from_user.id
         if not is_super_admin(user_id):
             await callback.answer("Недостаточно прав", show_alert=True)
@@ -445,28 +357,119 @@ def register_handlers(
         if not purchases:
             await send_to_callback_origin(callback, "Пока нет покупок 📭")
             return
-
-        csv_bytes = build_purchases_csv(purchases)
         filename = f"purchases_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        document = BufferedInputFile(csv_bytes, filename=filename)
-        target_message = callback.message
-        if target_message is not None:
-            await target_message.answer_document(document=document, caption="Готово ✅")
+        document = BufferedInputFile(build_purchases_csv(purchases), filename=filename)
+        if callback.message is not None:
+            await callback.message.answer_document(document=document, caption="Готово ✅")
             return
         await callback.bot.send_document(chat_id=user_id, document=document, caption="Готово ✅")
 
+    @router.callback_query(F.data == ADMIN_BROADCAST_CALLBACK)
+    async def on_admin_broadcast_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
+        user_id = callback.from_user.id
+        if not is_super_admin(user_id):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        await callback.answer()
+        await state.set_state(AdminBroadcastState.waiting_broadcast_text)
+        await send_to_callback_origin(callback, "📣 Отправьте текст рассылки одним сообщением.")
+
+    @router.message(AdminBroadcastState.waiting_broadcast_text)
+    async def on_admin_broadcast_message(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
+        user_id = message.from_user.id if message.from_user else 0
+        if not is_super_admin(user_id):
+            await state.clear()
+            await message.answer("⛔ Недостаточно прав.")
+            return
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer("Текст пустой. Пришлите сообщение для рассылки.")
+            return
+        recipients = await collect_broadcast_recipients(user_id)
+        if not recipients:
+            await state.clear()
+            await message.answer("Пока нет пользователей для рассылки 📭")
+            return
+        delivered, failed = 0, 0
+        payload = f"📣 Сообщение от организаторов:\n\n{text}"
+        for idx, recipient_id in enumerate(recipients, start=1):
+            try:
+                await message.bot.send_message(chat_id=recipient_id, text=payload)
+                delivered += 1
+            except Exception:
+                failed += 1
+                LOGGER.warning("Broadcast failed user=%s", recipient_id, exc_info=True)
+            if idx % 20 == 0:
+                await asyncio.sleep(0.2)
+        await state.clear()
+        await message.answer(
+            f"Рассылка завершена ✅\nДоставлено: {delivered}\nНе доставлено: {failed}",
+            reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)),
+        )
+
     @router.callback_query(F.data == ADMIN_CHECK_TICKET_CALLBACK)
     async def on_admin_check_ticket_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
         user_id = callback.from_user.id
         if not can_check_tickets(user_id):
             await callback.answer("Недостаточно прав", show_alert=True)
             return
         await callback.answer()
         await state.set_state(AdminTicketCheckState.waiting_ticket_number)
-        await send_to_callback_origin(callback, "Введите 3-значный номер билета для проверки 🎫")
+        await state.update_data(pending_ticket_number="")
+        await send_to_callback_origin(
+            callback,
+            "🎫 Режим проверки билетов включен.\nВводите 3-значный номер билета.",
+            reply_markup=admin_ticket_check_inline_keyboard(can_skip=False),
+        )
+
+    @router.callback_query(F.data == ADMIN_TICKET_SKIP_CALLBACK)
+    async def on_admin_ticket_skip_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
+        user_id = callback.from_user.id
+        if not can_check_tickets(user_id):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        pending_ticket_number = str((await state.get_data()).get("pending_ticket_number", "")).strip()
+        if not pending_ticket_number:
+            await callback.answer("Сначала проверьте билет", show_alert=True)
+            return
+        await callback.answer("Отмечаю билет…")
+        result = await payment_service.check_and_consume_ticket(pending_ticket_number)
+        await state.update_data(pending_ticket_number="")
+        if result.status == "valid_consumed" and result.payment is not None:
+            await send_to_callback_origin(
+                callback,
+                f"✅ Билет {result.payment.ticket_number} отмечен как использованный.\nВведите следующий номер.",
+                reply_markup=admin_ticket_check_inline_keyboard(can_skip=False),
+            )
+            return
+        if result.status == "already_used":
+            text = "❌ Билет уже использован."
+        elif result.status == "not_found":
+            text = "❌ Билет не найден."
+        elif result.status == "not_paid":
+            text = "❌ Оплата по билету не подтверждена."
+        else:
+            text = "⚠️ Не удалось отметить билет."
+        await send_to_callback_origin(callback, f"{text}\nВведите следующий номер.", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
+
+    @router.callback_query(F.data == ADMIN_TICKET_BACK_CALLBACK)
+    async def on_admin_ticket_back_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
+        user_id = callback.from_user.id
+        if not can_check_tickets(user_id):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await send_to_callback_origin(callback, "↩️ Возвращаю в главное меню.", reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)))
 
     @router.callback_query(F.data == ADMIN_SET_EVENT_ADDRESS_CALLBACK)
     async def on_admin_set_event_address_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
         user_id = callback.from_user.id
         if not is_super_admin(user_id):
             await callback.answer("Недостаточно прав", show_alert=True)
@@ -477,15 +480,15 @@ def register_handlers(
 
     @router.message(AdminEventAddressState.waiting_event_address)
     async def on_admin_event_address(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
         user_id = message.from_user.id if message.from_user else 0
         if not is_super_admin(user_id):
             await state.clear()
             await message.answer("⛔ Недостаточно прав.")
             return
-
         value = (message.text or "").strip()
         if len(value) < 5:
-            await message.answer("Слишком коротко. Введите нормальный адрес, пожалуйста 🙏")
+            await message.answer("Слишком коротко. Введите нормальный адрес 🙏")
             return
         await event_settings_service.set_event_address(value)
         await state.clear()
@@ -493,45 +496,52 @@ def register_handlers(
 
     @router.message(AdminTicketCheckState.waiting_ticket_number)
     async def on_admin_ticket_number(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
         user_id = message.from_user.id if message.from_user else 0
         if not can_check_tickets(user_id):
             await state.clear()
             await message.answer("⛔ Недостаточно прав.")
             return
 
-        ticket_number = (message.text or "").strip()
+        pending = str((await state.get_data()).get("pending_ticket_number", "")).strip()
+        if pending:
+            await message.answer(
+                "Сначала нажмите «Пропустить» для текущего билета или «Назад».",
+                reply_markup=admin_ticket_check_inline_keyboard(can_skip=True),
+            )
+            return
+
         try:
-            result = await payment_service.check_and_consume_ticket(ticket_number)
+            result = await payment_service.check_ticket((message.text or "").strip())
         except PaymentValidationError:
-            await message.answer("Нужны ровно 3 цифры. Пример: 123")
+            await message.answer("Нужны ровно 3 цифры. Пример: 123", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
             return
 
         if result.status == "not_found":
-            await state.clear()
-            await message.answer("❌ Билет недействителен: номер не найден.")
+            await message.answer("❌ Билет недействителен: номер не найден.\nВведите следующий номер.", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
             return
-
         if result.status == "not_paid":
-            await state.clear()
-            await message.answer("❌ Билет недействителен: оплата не подтверждена.")
+            await message.answer("❌ Билет недействителен: оплата не подтверждена.\nВведите следующий номер.", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
             return
-
         if result.status == "already_used":
-            await state.clear()
-            await message.answer("❌ Билет уже использован.")
+            await message.answer("❌ Билет уже использован.\nВведите следующий номер.", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
             return
-
-        payment = result.payment
-        await state.clear()
-        await message.answer(
-            "✅ Билет действителен и сейчас помечен как использованный.\n"
-            f"Номер: {payment.ticket_number}\n"
-            f"Покупатель: {payment.full_name}\n"
-            f"Телефон: {payment.phone}",
-        )
+        if result.status == "valid" and result.payment and result.payment.ticket_number:
+            await state.update_data(pending_ticket_number=result.payment.ticket_number)
+            await message.answer(
+                "✅ Билет действителен.\n"
+                f"Номер: {result.payment.ticket_number}\n"
+                f"Покупатель: {result.payment.full_name or '—'}\n"
+                f"Телефон: {result.payment.phone or '—'}\n\n"
+                "Нажмите «Пропустить», чтобы отметить его как использованный.",
+                reply_markup=admin_ticket_check_inline_keyboard(can_skip=True),
+            )
+            return
+        await message.answer("⚠️ Не удалось обработать билет. Введите следующий номер.", reply_markup=admin_ticket_check_inline_keyboard(can_skip=False))
 
     @router.message(PurchaseFormState.waiting_full_name)
     async def on_waiting_full_name(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
         value = (message.text or "").strip()
         if len(value) < 5:
             await message.answer("ФИО слишком короткое. Введите полное ФИО 🙏")
@@ -542,13 +552,14 @@ def register_handlers(
 
     @router.message(PurchaseFormState.waiting_age)
     async def on_waiting_age(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
         value = (message.text or "").strip()
         if not value.isdigit():
             await message.answer("Возраст нужен цифрами. Пример: 24")
             return
         age = int(value)
         if age < 18:
-            await message.answer("🚫 На это мероприятие только 18+.\nК сожалению, продолжить оформление нельзя.")
+            await message.answer("🚫 На это мероприятие только 18+.\nПродолжить оформление нельзя.")
             await state.clear()
             return
         if age > 120:
@@ -560,12 +571,12 @@ def register_handlers(
 
     @router.message(PurchaseFormState.waiting_phone)
     async def on_waiting_phone(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
         value = (message.text or "").strip()
         if not PHONE_PATTERN.match(value):
             await message.answer("Формат телефона не подошел. Пример: +79991234567")
             return
-        normalized = re.sub(r"\s+", "", value)
-        await state.update_data(phone=normalized)
+        await state.update_data(phone=re.sub(r"\s+", "", value))
         if message.from_user is None:
             await message.answer("Не удалось определить пользователя. Нажмите /start")
             return
@@ -573,8 +584,6 @@ def register_handlers(
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def on_fallback(message: Message) -> None:
+        await remember_user(message.from_user)
         user_id = message.from_user.id if message.from_user else 0
-        await message.answer(
-            "🤖 Давайте по кнопкам, так надежнее 😌",
-            reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)),
-        )
+        await message.answer("🤖 Давайте по кнопкам, так надежнее 😌", reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)))

@@ -20,6 +20,9 @@ HELP_CALLBACK = "help"
 ADMIN_EXPORT_CALLBACK = "admin_export_purchases"
 ADMIN_CHECK_TICKET_CALLBACK = "admin_check_ticket"
 ADMIN_SET_EVENT_ADDRESS_CALLBACK = "admin_set_event_address"
+ADMIN_BROADCAST_CALLBACK = "admin_broadcast"
+ADMIN_TICKET_SKIP_CALLBACK = "admin_ticket_skip"
+ADMIN_TICKET_BACK_CALLBACK = "admin_ticket_back"
 
 
 def main_menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
@@ -61,13 +64,24 @@ def admin_panel_inline_keyboard(
     *,
     can_export: bool,
     can_set_event_address: bool,
+    can_broadcast: bool,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if can_export:
         rows.append([InlineKeyboardButton(text="📤 Выгрузить покупки (CSV)", callback_data=ADMIN_EXPORT_CALLBACK)])
-    rows.append([InlineKeyboardButton(text="✅ Проверить билет", callback_data=ADMIN_CHECK_TICKET_CALLBACK)])
+    rows.append([InlineKeyboardButton(text="✅ Проверить билеты", callback_data=ADMIN_CHECK_TICKET_CALLBACK)])
     if can_set_event_address:
         rows.append(
             [InlineKeyboardButton(text="📍 Изменить адрес мероприятия", callback_data=ADMIN_SET_EVENT_ADDRESS_CALLBACK)]
         )
+    if can_broadcast:
+        rows.append([InlineKeyboardButton(text="📣 Сделать рассылку", callback_data=ADMIN_BROADCAST_CALLBACK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_ticket_check_inline_keyboard(*, can_skip: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_skip:
+        rows.append([InlineKeyboardButton(text="✅ Пропустить", callback_data=ADMIN_TICKET_SKIP_CALLBACK)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=ADMIN_TICKET_BACK_CALLBACK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)

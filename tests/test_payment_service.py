@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from app.domain import PaymentRecord, PaymentStatus
-from app.integrations.yookassa_client import YooKassaPayment
+from app.integrations.yookassa_client import YooKassaAPIError, YooKassaPayment
 from app.services.payment_service import PaymentService
 
 
@@ -146,6 +146,7 @@ class InMemoryPaymentRepository:
 class FakeYooKassaClient:
     def __init__(self) -> None:
         self.create_calls = 0
+        self.get_error: Exception | None = None
         self._remote_payment = YooKassaPayment(
             payment_id="pay_001",
             status="pending",
@@ -165,6 +166,8 @@ class FakeYooKassaClient:
         return self._remote_payment
 
     async def get_payment(self, _: str) -> YooKassaPayment:
+        if self.get_error is not None:
+            raise self.get_error
         return self._remote_payment
 
     def set_status(self, status: str) -> None:
@@ -333,3 +336,35 @@ async def test_check_and_consume_ticket_lifecycle() -> None:
     assert pending_ticket.status == PaymentStatus.PENDING
     pending_check = await service.check_and_consume_ticket("998")
     assert pending_check.status == "not_paid"
+
+
+@pytest.mark.asyncio
+async def test_refresh_latest_user_payment_falls_back_when_remote_payment_inaccessible() -> None:
+    repo = InMemoryPaymentRepository()
+    client = FakeYooKassaClient()
+    service = PaymentService(repository=repo, yookassa_client=client)
+
+    created = await service.create_payment(
+        telegram_user_id=321,
+        full_name="Legacy User",
+        age=28,
+        phone="+79990001122",
+        amount_rub=Decimal("299.00"),
+        description="Ticket",
+        metadata={},
+        idempotency_key="key-legacy-1",
+        return_url="https://t.me",
+    )
+    assert created.status == PaymentStatus.PENDING
+
+    client.get_error = YooKassaAPIError(
+        message="Incorrect payment_id. Payment doesn't exist or access denied.",
+        status_code=400,
+        error_code="invalid_request",
+        retryable=False,
+    )
+
+    refreshed = await service.refresh_latest_user_payment(321)
+    assert refreshed is not None
+    assert refreshed.local_id == created.local_id
+    assert refreshed.status == PaymentStatus.CANCELED

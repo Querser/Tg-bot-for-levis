@@ -67,6 +67,7 @@ async def run() -> None:
     event_settings_service = EventSettingsService(
         repository=app_settings_repository,
         default_event_address=settings.default_event_address,
+        default_ticket_price_rub=settings.payment_amount_rub,
     )
 
     proxies = getproxies() if settings.http_trust_env else {}

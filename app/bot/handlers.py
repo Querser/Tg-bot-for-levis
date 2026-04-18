@@ -22,6 +22,7 @@ from app.bot.keyboards import (
     ADMIN_EXPORT_CALLBACK,
     ADMIN_PANEL_BUTTON_TEXT,
     ADMIN_SET_EVENT_ADDRESS_CALLBACK,
+    ADMIN_SET_TICKET_PRICE_CALLBACK,
     ADMIN_TICKET_BACK_CALLBACK,
     ADMIN_TICKET_SKIP_CALLBACK,
     BUY_TICKET_BUTTON_TEXT,
@@ -39,7 +40,7 @@ from app.bot.keyboards import (
     payment_inline_keyboard,
 )
 from app.domain import PaymentRecord, PaymentStatus
-from app.services import EventSettingsService
+from app.services import EventSettingsService, EventSettingsValidationError
 from app.services.payment_service import PaymentService, PaymentServiceError, PaymentValidationError
 
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +59,10 @@ class AdminTicketCheckState(StatesGroup):
 
 class AdminEventAddressState(StatesGroup):
     waiting_event_address = State()
+
+
+class AdminTicketPriceState(StatesGroup):
+    waiting_ticket_price = State()
 
 
 class AdminBroadcastState(StatesGroup):
@@ -110,6 +115,7 @@ def register_handlers(
             reply_markup=admin_panel_inline_keyboard(
                 can_export=is_super_admin(user_id),
                 can_set_event_address=is_super_admin(user_id),
+                can_set_ticket_price=is_super_admin(user_id),
                 can_broadcast=is_super_admin(user_id),
             ),
         )
@@ -164,6 +170,12 @@ def register_handlers(
             await sender("⚠️ Не хватает данных анкеты. Нажмите «Купить билет» и заполните заново.", reply_markup=main_actions_inline_keyboard())
             return
 
+        ticket_price_rub = payment_amount_rub
+        try:
+            ticket_price_rub = await event_settings_service.get_ticket_price_rub()
+        except Exception:
+            LOGGER.exception("Failed to load ticket price from settings. Fallback to default value.")
+
         buy_inflight.add(user.id)
         try:
             payment = await payment_service.create_payment(
@@ -171,7 +183,7 @@ def register_handlers(
                 full_name=full_name,
                 age=int(age_raw),
                 phone=phone,
-                amount_rub=payment_amount_rub,
+                amount_rub=ticket_price_rub,
                 description=payment_description,
                 metadata={"source": "telegram_bot", "product": "event_ticket", "full_name": full_name, "age": str(age_raw), "phone": phone},
                 idempotency_key=f"tg-{user.id}-{uuid4().hex}",
@@ -478,6 +490,22 @@ def register_handlers(
         await state.set_state(AdminEventAddressState.waiting_event_address)
         await send_to_callback_origin(callback, "Введите новый адрес мероприятия 📍")
 
+    @router.callback_query(F.data == ADMIN_SET_TICKET_PRICE_CALLBACK)
+    async def on_admin_set_ticket_price_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await remember_user(callback.from_user)
+        user_id = callback.from_user.id
+        if not is_super_admin(user_id):
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+        current_price = await event_settings_service.get_ticket_price_rub()
+        await callback.answer()
+        await state.set_state(AdminTicketPriceState.waiting_ticket_price)
+        await send_to_callback_origin(
+            callback,
+            f"Текущая цена: {current_price} RUB\n"
+            "Введите новую цену билета (например, 299 или 299.50).",
+        )
+
     @router.message(AdminEventAddressState.waiting_event_address)
     async def on_admin_event_address(message: Message, state: FSMContext) -> None:
         await remember_user(message.from_user)
@@ -493,6 +521,28 @@ def register_handlers(
         await event_settings_service.set_event_address(value)
         await state.clear()
         await message.answer(f"✅ Адрес сохранен:\n📍 {value}")
+
+    @router.message(AdminTicketPriceState.waiting_ticket_price)
+    async def on_admin_ticket_price(message: Message, state: FSMContext) -> None:
+        await remember_user(message.from_user)
+        user_id = message.from_user.id if message.from_user else 0
+        if not is_super_admin(user_id):
+            await state.clear()
+            await message.answer("⛔ Недостаточно прав.")
+            return
+
+        raw_value = (message.text or "").strip()
+        try:
+            new_price = await event_settings_service.set_ticket_price_rub(raw_value)
+        except EventSettingsValidationError:
+            await message.answer(
+                "Неверный формат цены. Пример: 299 или 299.50\n"
+                "Цена должна быть больше нуля."
+            )
+            return
+
+        await state.clear()
+        await message.answer(f"✅ Новая цена билета: {new_price} RUB")
 
     @router.message(AdminTicketCheckState.waiting_ticket_number)
     async def on_admin_ticket_number(message: Message, state: FSMContext) -> None:

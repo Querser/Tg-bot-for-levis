@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Protocol, runtime_checkable
 
 
@@ -17,6 +18,7 @@ class AppSettingsRepositoryProtocol(Protocol):
 
 class EventSettingsService:
     EVENT_ADDRESS_KEY = "event_address"
+    TICKET_PRICE_RUB_KEY = "ticket_price_rub"
     KNOWN_USER_IDS_KEY = "known_user_ids"
 
     def __init__(
@@ -24,9 +26,11 @@ class EventSettingsService:
         *,
         repository: AppSettingsRepositoryProtocol,
         default_event_address: str,
+        default_ticket_price_rub: Decimal,
     ) -> None:
         self._repository = repository
         self._default_event_address = self._require_non_empty(default_event_address, "default_event_address")
+        self._default_ticket_price_rub = self._normalize_price_rub(default_ticket_price_rub)
 
     async def get_event_address(self) -> str:
         value = await self._repository.get_value(self.EVENT_ADDRESS_KEY)
@@ -39,6 +43,20 @@ class EventSettingsService:
         if len(clean) > 500:
             raise EventSettingsValidationError("event_address is too long (max 500 chars).")
         await self._repository.set_value(self.EVENT_ADDRESS_KEY, clean)
+        return clean
+
+    async def get_ticket_price_rub(self) -> Decimal:
+        raw_value = await self._repository.get_value(self.TICKET_PRICE_RUB_KEY)
+        if raw_value is None or not raw_value.strip():
+            return self._default_ticket_price_rub
+        try:
+            return self._normalize_price_rub(raw_value)
+        except EventSettingsValidationError:
+            return self._default_ticket_price_rub
+
+    async def set_ticket_price_rub(self, value: Decimal | str | float | int) -> Decimal:
+        clean = self._normalize_price_rub(value)
+        await self._repository.set_value(self.TICKET_PRICE_RUB_KEY, format(clean, "f"))
         return clean
 
     async def register_known_user(self, telegram_user_id: int) -> None:
@@ -87,3 +105,17 @@ class EventSettingsService:
         if user_id <= 0:
             raise EventSettingsValidationError("telegram_user_id must be greater than zero.")
         return user_id
+
+    @staticmethod
+    def _normalize_price_rub(value: Decimal | str | float | int) -> Decimal:
+        raw = str(value).strip().replace(",", ".")
+        try:
+            amount = Decimal(raw)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise EventSettingsValidationError("ticket price must be a valid number.") from exc
+        normalized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if normalized <= Decimal("0.00"):
+            raise EventSettingsValidationError("ticket price must be greater than zero.")
+        if normalized > Decimal("1000000.00"):
+            raise EventSettingsValidationError("ticket price is too large.")
+        return normalized

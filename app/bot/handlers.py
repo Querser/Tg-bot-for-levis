@@ -78,6 +78,7 @@ def register_handlers(
     payment_amount_rub: Decimal = Decimal("299.00"),
     payment_description: str = "Оплата билета",
     payment_return_url: str = "https://t.me",
+    max_tickets: int = 100,
 ) -> None:
     buy_inflight: set[int] = set()
     super_admin_set = {int(x) for x in super_admin_ids}
@@ -154,8 +155,15 @@ def register_handlers(
     async def start_profile_collection(user: User, state: FSMContext, sender) -> None:
         await state.clear()
         await state.set_state(PurchaseFormState.waiting_full_name)
+        ticket_price_rub = payment_amount_rub
+        try:
+            ticket_price_rub = await event_settings_service.get_ticket_price_rub()
+        except Exception:
+            LOGGER.exception("Failed to load ticket price before profile collection. Fallback to default value.")
         await sender(
-            "🎟 Перед оплатой заполните данные.\nШаг 1/3: отправьте ФИО.",
+            "🎟 Перед оплатой заполните данные.\n"
+            f"💸 Цена билета: {ticket_price_rub} RUB\n"
+            "Шаг 1/3: отправьте ФИО.",
             reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user.id)),
         )
 
@@ -169,6 +177,12 @@ def register_handlers(
         age_raw = data.get("age")
         if not full_name or not phone or age_raw is None:
             await sender("⚠️ Не хватает данных анкеты. Нажмите «Купить билет» и заполните заново.", reply_markup=main_actions_inline_keyboard())
+            return
+
+        successful_count = await payment_service.count_successful_payments()
+        if successful_count >= max_tickets:
+            await state.clear()
+            await sender("🚫 Билеты закончились. Доступно максимум 100 билетов.", reply_markup=main_actions_inline_keyboard())
             return
 
         try:
@@ -203,6 +217,11 @@ def register_handlers(
             buy_inflight.discard(user.id)
 
     async def process_buy(user: User, sender, state: FSMContext) -> None:
+        successful_count = await payment_service.count_successful_payments()
+        if successful_count >= max_tickets:
+            await sender("🚫 Билеты закончились. Доступно максимум 100 билетов.", reply_markup=main_actions_inline_keyboard())
+            return
+
         latest = await payment_service.refresh_latest_user_payment(user.id)
         if latest and latest.status in {PaymentStatus.PENDING, PaymentStatus.WAITING_FOR_CAPTURE}:
             refreshed = latest

@@ -278,8 +278,22 @@ async def test_webhook_updates_payment_status_and_export_list() -> None:
     assert result is not None
     assert result.status == PaymentStatus.SUCCEEDED
 
+    await service.create_payment(
+        telegram_user_id=43,
+        full_name="Pending User",
+        age=29,
+        phone="+79992220000",
+        amount_rub=Decimal("120.00"),
+        description="Ticket",
+        metadata={},
+        idempotency_key="key-3-pending",
+        return_url="https://t.me",
+    )
+
     purchases = await service.list_purchases()
     assert purchases
+    assert len(purchases) == 1
+    assert purchases[0].status == PaymentStatus.SUCCEEDED
     assert purchases[0].full_name == "Sidor Sidorov"
     assert purchases[0].age == 35
 

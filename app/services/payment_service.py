@@ -277,7 +277,12 @@ class PaymentService:
         return TicketCheckResult(status="valid", payment=payment)
 
     async def list_purchases(self) -> list[PaymentRecord]:
-        return await self._repository.list_all()
+        purchases = await self._repository.list_all()
+        return [item for item in purchases if item.status == PaymentStatus.SUCCEEDED]
+
+    async def count_successful_payments(self) -> int:
+        purchases = await self._repository.list_all()
+        return sum(1 for item in purchases if item.status == PaymentStatus.SUCCEEDED)
 
     async def list_user_tickets(self, telegram_user_id: int) -> list[PaymentRecord]:
         clean_telegram_user_id = self._normalize_telegram_user_id(telegram_user_id)

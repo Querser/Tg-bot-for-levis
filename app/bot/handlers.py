@@ -33,6 +33,8 @@ from app.bot.keyboards import (
     HELP_CALLBACK,
     MY_TICKETS_BUTTON_TEXT,
     MY_TICKETS_CALLBACK,
+    SUPPORT_BUTTON_TEXT,
+    SUPPORT_CALLBACK,
     admin_panel_inline_keyboard,
     admin_ticket_check_inline_keyboard,
     main_actions_inline_keyboard,
@@ -45,6 +47,7 @@ from app.services.payment_service import PaymentService, PaymentServiceError, Pa
 
 LOGGER = logging.getLogger(__name__)
 PHONE_PATTERN = re.compile(r"^\+?[0-9\-\s\(\)]{10,20}$")
+SUPPORT_CONTACT_URL = "https://t.me/G0ENDUR0"
 
 
 class PurchaseFormState(StatesGroup):
@@ -119,6 +122,13 @@ def register_handlers(
                 can_set_ticket_price=is_super_admin(user_id),
                 can_broadcast=is_super_admin(user_id),
             ),
+        )
+
+    async def send_support_info(sender, user_id: int) -> None:
+        await sender(
+            "🛟 Поддержка\n"
+            f"Связь с нами: {SUPPORT_CONTACT_URL}",
+            reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)),
         )
 
     async def handle_payment_state(payment: PaymentRecord | None, sender) -> None:
@@ -319,6 +329,12 @@ def register_handlers(
             reply_markup=main_menu_keyboard(is_admin=can_check_tickets(user_id)),
         )
 
+    @router.message(Command("support"))
+    async def on_support(message: Message) -> None:
+        await remember_user(message.from_user)
+        user_id = message.from_user.id if message.from_user else 0
+        await send_support_info(message.answer, user_id)
+
     @router.message(Command("admin"))
     async def on_admin_command(message: Message) -> None:
         await remember_user(message.from_user)
@@ -351,6 +367,12 @@ def register_handlers(
     async def on_help_message(message: Message) -> None:
         await on_help(message)
 
+    @router.message(F.text.casefold() == SUPPORT_BUTTON_TEXT.casefold())
+    async def on_support_message(message: Message) -> None:
+        await remember_user(message.from_user)
+        user_id = message.from_user.id if message.from_user else 0
+        await send_support_info(message.answer, user_id)
+
     @router.callback_query(F.data == BUY_TICKET_CALLBACK)
     async def on_buy_callback(callback: CallbackQuery, state: FSMContext) -> None:
         await remember_user(callback.from_user)
@@ -374,6 +396,16 @@ def register_handlers(
         await remember_user(callback.from_user)
         await callback.answer()
         await send_to_callback_origin(callback, "Нужна помощь? Напишите администратору 🙌\nМероприятие строго 18+ 🔞", reply_markup=main_actions_inline_keyboard())
+
+    @router.callback_query(F.data == SUPPORT_CALLBACK)
+    async def on_support_callback(callback: CallbackQuery) -> None:
+        await remember_user(callback.from_user)
+        await callback.answer()
+        await send_to_callback_origin(
+            callback,
+            f"🛟 Поддержка\nСвязь с нами: {SUPPORT_CONTACT_URL}",
+            reply_markup=main_actions_inline_keyboard(),
+        )
 
     @router.callback_query(F.data == ADMIN_EXPORT_CALLBACK)
     async def on_admin_export_callback(callback: CallbackQuery) -> None:

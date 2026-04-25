@@ -11,12 +11,14 @@ BUY_TICKET_BUTTON_TEXT = "🎟 Купить билет"
 CHECK_PAYMENT_BUTTON_TEXT = "🔄 Проверить оплату"
 MY_TICKETS_BUTTON_TEXT = "🎫 Мои билеты"
 HELP_BUTTON_TEXT = "ℹ️ Помощь"
+SUPPORT_BUTTON_TEXT = "🛟 Поддержка"
 ADMIN_PANEL_BUTTON_TEXT = "🛠 Админ панель"
 
 BUY_TICKET_CALLBACK = "buy_ticket"
 CHECK_PAYMENT_CALLBACK = "check_payment"
 MY_TICKETS_CALLBACK = "my_tickets"
 HELP_CALLBACK = "help"
+SUPPORT_CALLBACK = "support"
 ADMIN_EXPORT_CALLBACK = "admin_export_purchases"
 ADMIN_CHECK_TICKET_CALLBACK = "admin_check_ticket"
 ADMIN_SET_EVENT_ADDRESS_CALLBACK = "admin_set_event_address"
@@ -31,6 +33,7 @@ def main_menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BUY_TICKET_BUTTON_TEXT)],
         [KeyboardButton(text=MY_TICKETS_BUTTON_TEXT)],
         [KeyboardButton(text=HELP_BUTTON_TEXT)],
+        [KeyboardButton(text=SUPPORT_BUTTON_TEXT)],
     ]
     if is_admin:
         keyboard.append([KeyboardButton(text=ADMIN_PANEL_BUTTON_TEXT)])
@@ -47,6 +50,7 @@ def main_actions_inline_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=BUY_TICKET_BUTTON_TEXT, callback_data=BUY_TICKET_CALLBACK)],
             [InlineKeyboardButton(text=MY_TICKETS_BUTTON_TEXT, callback_data=MY_TICKETS_CALLBACK)],
             [InlineKeyboardButton(text=HELP_BUTTON_TEXT, callback_data=HELP_CALLBACK)],
+            [InlineKeyboardButton(text=SUPPORT_BUTTON_TEXT, callback_data=SUPPORT_CALLBACK)],
         ]
     )
 
